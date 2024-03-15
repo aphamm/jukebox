@@ -12,6 +12,9 @@ from jukebox.save_html import save_html
 from jukebox.utils.sample_utils import split_batch, get_starts
 from jukebox.utils.dist_utils import print_once
 import fire
+import soundfile
+import time
+import glob
 
 # Sample a partial window of length<n_ctx with tokens_to_sample new tokens on level=level
 def sample_partial_window(zs, labels, sampling_kwargs, level, prior, tokens_to_sample, hps):
@@ -258,14 +261,67 @@ def save_samples(model, device, hps, sample_hps):
         assert sample_hps.audio_file is not None
         assert sample_hps.prompt_length_in_seconds is not None
         audio_files = sample_hps.audio_file.split(',')
+        # if top_raw_to_tokens==128, then at top level, 128 audio samples correspond to a single token
         top_raw_to_tokens = priors[-1].raw_to_tokens
+        # floor desired audio sample duration down to nearest top_raw_to_tokens
         duration = (int(sample_hps.prompt_length_in_seconds * hps.sr) // top_raw_to_tokens) * top_raw_to_tokens
+        # x is shape (n_samples, time, channels)
         x = load_prompts(audio_files, duration, hps)
         primed_sample(x, labels, sampling_kwargs, priors, hps)
     else:
         raise ValueError(f'Unknown sample mode {sample_hps.mode}.')
 
+# Encode and decode a given audio sample
+def encode_decode(model, device, hps, sample_hps):
 
+    audio_files = glob.glob(f'./{sample_hps.audio_file}/*.mp3')
+    names = [f.split('/')[-1].split('.')[0] for f in audio_files]
+    print("processing songs", names)
+
+    vqvae, _ = make_model(model, device, hps)
+    sample_levels = [(0, "bot"), (1, "mid"), (2, "top")]
+    weights = (1/2.0, 1/2.0)
+
+    top_raw_to_tokens = 128
+    duration = (int(hps.sample_length_in_seconds * hps.sr) // top_raw_to_tokens) * top_raw_to_tokens
+    xs = []
+    for audio_file in audio_files:
+        x = load_audio(audio_file, sr=hps.sr, duration=duration, offset=0.0, mono=True)
+        x = x.T # (channels, time) -> (time, channels)
+        x = t.stack([t.from_numpy(x)]) # (1, time, channels)
+        x = x.to('cuda', non_blocking=True)
+        xs.append(x)
+
+    songs_indices = [] # [[tensor.bot_index, tensor.mid_index, tensor.top_index], [ ... song2 ... ], [ ... song3 ... ]]
+    for x in xs:
+        song_index = vqvae.encode(x, start_level=0, end_level=hps.levels, bs_chunks=x.shape[0])
+        songs_indices.append(song_index)
+    
+    interpolated_indices = []
+    for level, level_name in sample_levels:
+        # indices: [ tensor.bot_index_s1, tensor.bot_index_s2, tensor.bot_index_s3 ]
+        indices = [song[level] for song in songs_indices] 
+        # latents: [ tensor.bot_latents_s1, tensor.bot_latents_s2, tensor.bot_latents_s3 ]
+        latents = [vqvae.bottleneck.level_blocks[level].decode(index) for index in indices]
+        # weighted_latent shape ( num_songs, 1, emb_size, samples )
+        weighted_latents = t.stack([latent * weight for latent, weight in zip(latents, weights)])
+        interpolated_lantents = t.mean(weighted_latents, dim=0)
+        interpolated_index = vqvae.bottleneck.level_blocks[level].encode(interpolated_lantents)
+        interpolated_indices.append(interpolated_index)
+
+    for level, level_name in sample_levels:
+        start = time.monotonic_ns()
+        x = vqvae.decode(interpolated_indices[level:level+1], start_level=level, end_level=level+1, bs_chunks=interpolated_indices[level].shape[0])
+        # x = vqvae.decode(zs[level:], start_level=level, bs_chunks=zs[level].shape[0])
+        print(f"{level_name} decode: {(time.monotonic_ns() - start) / 1e9:.6f} secs")
+
+        out_dir = f"{sample_hps.audio_file}/remake"
+        if not os.path.exists(out_dir):
+            os.makedirs(out_dir)
+
+        aud = t.clamp(x, -1, 1).cpu().numpy() # clip before saving
+        soundfile.write(f'{out_dir}/{level_name}.wav', aud[0], samplerate=hps.sr, format='wav')
+    
 def run(model, mode='ancestral', codes_file=None, audio_file=None, prompt_length_in_seconds=None, port=29500, **kwargs):
     from jukebox.utils.dist_utils import setup_dist_from_mpi
     rank, local_rank, device = setup_dist_from_mpi(port=port)
@@ -273,7 +329,7 @@ def run(model, mode='ancestral', codes_file=None, audio_file=None, prompt_length
     sample_hps = Hyperparams(dict(mode=mode, codes_file=codes_file, audio_file=audio_file, prompt_length_in_seconds=prompt_length_in_seconds))
 
     with t.no_grad():
-        save_samples(model, device, hps, sample_hps)
+        encode_decode(model, device, hps, sample_hps)
 
 if __name__ == '__main__':
     fire.Fire(run)

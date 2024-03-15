@@ -82,7 +82,7 @@ def make_vqvae(hps, device='cuda'):
         downsamples = calculate_strides(hps.strides_t, hps.downs_t)
         top_raw_to_tokens = np.prod(downsamples)
         hps.sample_length = (hps.sample_length_in_seconds * hps.sr // top_raw_to_tokens) * top_raw_to_tokens
-        print(f"Setting sample length to {hps.sample_length} (i.e. {hps.sample_length/hps.sr} seconds) to be multiple of {top_raw_to_tokens}")
+        print(f"Setting sample length to {hps.sample_length} (i.e. {hps.sample_length/hps.sr:.5f} seconds) to be multiple of {top_raw_to_tokens}")
 
     vqvae = VQVAE(input_shape=(hps.sample_length,1), levels=hps.levels, downs_t=hps.downs_t, strides_t=hps.strides_t,
                   emb_width=hps.emb_width, l_bins=hps.l_bins,
@@ -186,14 +186,11 @@ def make_prior(hps, vqvae, device='cuda'):
         freeze_model(prior)
     return prior
 
-def make_model(model, device, hps, levels=None):
+def make_model(model, device, hps):
     vqvae, *priors = MODELS[model]
     vqvae = make_vqvae(setup_hparams(vqvae, dict(sample_length=hps.get('sample_length', 0), sample_length_in_seconds=hps.get('sample_length_in_seconds', 0))), device)
     hps.sample_length = vqvae.sample_length
-    if levels is None:
-        levels = range(len(priors))
-    priors = [make_prior(setup_hparams(priors[level], dict()), vqvae, 'cpu') for level in levels]
-    return vqvae, priors
+    return vqvae, None
 
 def save_outputs(model, device, hps):
     # Check logits
